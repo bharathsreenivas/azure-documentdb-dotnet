@@ -28,7 +28,7 @@ namespace DocumentDBBenchmark
             ConnectionMode = ConnectionMode.Gateway, 
             ConnectionProtocol = Protocol.Tcp, 
             RequestTimeout = new TimeSpan(1, 0, 0), 
-            MaxConnectionLimit = 1000, 
+            MaxConnectionLimit = 10000, 
             RetryOptions = new RetryOptions 
             { 
                 MaxRetryAttemptsOnThrottledRequests = 10,
@@ -41,7 +41,7 @@ namespace DocumentDBBenchmark
             ConnectionMode = ConnectionMode.Direct,
             ConnectionProtocol = Protocol.Tcp,
             RequestTimeout = new TimeSpan(1, 0, 0),
-            MaxConnectionLimit = 1000,
+            MaxConnectionLimit = 10000,
             RetryOptions = new RetryOptions
             {
                 MaxRetryAttemptsOnThrottledRequests = 10,
@@ -73,7 +73,7 @@ namespace DocumentDBBenchmark
         private int pendingTaskCount;
         private long documentsProcessed;
         private ConcurrentDictionary<int, double> requestUnitsConsumed = new ConcurrentDictionary<int, double>();
-        private ConcurrentDictionary<int, HashSet<DocumentInfo>> documentsPerTask = new ConcurrentDictionary<int, HashSet<DocumentInfo>>();
+        private ConcurrentDictionary<int, List<DocumentInfo>> documentsPerTask = new ConcurrentDictionary<int, List<DocumentInfo>>();
         private DocumentClient client;
 
         /// <summary>
@@ -91,7 +91,7 @@ namespace DocumentDBBenchmark
         /// <param name="args">command line arguments.</param>
         public static void Main(string[] args)
         {
-            //ThreadPool.SetMinThreads(MinThreadPoolSize, MinThreadPoolSize);
+            // ThreadPool.SetMinThreads(MinThreadPoolSize, MinThreadPoolSize);
 
             string endpoint = ConfigurationManager.AppSettings["EndPointUrl"];
             string authKey = ConfigurationManager.AppSettings["AuthorizationKey"];
@@ -202,15 +202,24 @@ namespace DocumentDBBenchmark
 
             await Task.WhenAll(writeTasks);
 
+            int splitListIntoParts = 3;
             requestUnitsConsumed.Clear();
             documentsProcessed = 0;
-            pendingTaskCount = taskCount;
+            pendingTaskCount = taskCount * splitListIntoParts;
             var readTasks = new List<Task>();
+            Console.WriteLine("Starting reads with {0} tasks", taskCount * 3);
+
             readTasks.Add(this.LogOutputStats(TaskType.Read));
 
             foreach (var document in documentsPerTask)
             {
-                readTasks.Add(this.ReadDocument(document.Key, document.Value));
+                var values = splitList(document.Value, document.Value.Count()/ splitListIntoParts);
+                int count = 0;
+                foreach(var value in values)
+                {
+                    readTasks.Add(this.ReadDocument(taskCount * count + document.Key, values.ToArray()[0]));
+                    count++;
+                }
             }
 
             await Task.WhenAll(readTasks);
@@ -222,12 +231,20 @@ namespace DocumentDBBenchmark
             }
         }
 
+        private static IEnumerable<List<T>> splitList<T>(List<T> locations, int nSize = 30)
+        {
+            for (int i = 0; i < locations.Count; i += nSize)
+            {
+                yield return locations.GetRange(i, Math.Min(nSize, locations.Count - i));
+            }
+        }
+
         private async Task InsertDocument(int taskId, DocumentCollection collection, string sampleJson, long numberOfDocumentsToInsert)
         {
             requestUnitsConsumed[taskId] = 0;
             string partitionKeyProperty = collection.PartitionKey.Paths[0].Replace("/", "");
             Dictionary<string, object> newDictionary = JsonConvert.DeserializeObject<Dictionary<string, object>>(sampleJson);
-            documentsPerTask.TryAdd(taskId, new HashSet<DocumentInfo>());
+            documentsPerTask.TryAdd(taskId, new List<DocumentInfo>());
 
             for (var i = 0; i < numberOfDocumentsToInsert; i++)
             {
@@ -244,7 +261,7 @@ namespace DocumentDBBenchmark
 
                     string partition = response.SessionToken.Split(':')[0];
                     requestUnitsConsumed[taskId] += response.RequestCharge;
-                    documentsPerTask[taskId].Add(new DocumentInfo(partitionKey, response.Resource.Id));
+                    documentsPerTask[taskId].Add(new DocumentInfo(partitionKey, response.Resource.SelfLink));
                     Interlocked.Increment(ref this.documentsProcessed);
                 }
                 catch (Exception e)
@@ -267,7 +284,7 @@ namespace DocumentDBBenchmark
             Interlocked.Decrement(ref this.pendingTaskCount);
         }
 
-        private async Task ReadDocument(int taskId, HashSet<DocumentInfo> documents)
+        private async Task ReadDocument(int taskId, List<DocumentInfo> documents)
         {
             requestUnitsConsumed[taskId] = 0;
 
@@ -275,11 +292,10 @@ namespace DocumentDBBenchmark
             {
                 try
                 {
-                    var response = await client.ReadDocumentAsync(UriFactory.CreateDocumentUri(DatabaseName, DataCollectionName, document.Id), new RequestOptions
+                    var response = await client.ReadDocumentAsync(document.Id, new RequestOptions
                     {
-                        PartitionKey = new PartitionKey(document.PartitionKey)                        
+                        PartitionKey = new PartitionKey(document.PartitionKey)
                     });
-
                     requestUnitsConsumed[taskId] += response.RequestCharge;
                     Interlocked.Increment(ref this.documentsProcessed);
                 }
@@ -301,6 +317,7 @@ namespace DocumentDBBenchmark
             }
             Interlocked.Decrement(ref this.pendingTaskCount);
         }
+
 
         private async Task LogOutputStats(TaskType taskType)
         {
